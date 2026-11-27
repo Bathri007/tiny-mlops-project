@@ -2,7 +2,9 @@
 # wokwi/wokwi-ci-action). Paths are relative to this directory (firmware_esp32/).
 [wokwi]
 version = 1
-firmware = ".pio/build/esp32dev/firmware.bin"
+# Full 4 MB image (bootloader + OUR partition table + app), written by tools/merge_firmware.py.
+# The app-only firmware.bin would make Wokwi use its own table without the LittleFS model slots.
+firmware = ".pio/build/esp32dev/firmware.merged.bin"
 elf = ".pio/build/esp32dev/firmware.elf"
 
 # Exposes the simulated ESP32 UART0 as an RFC2217 serial server while the VS Code

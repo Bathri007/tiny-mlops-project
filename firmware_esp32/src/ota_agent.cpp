@@ -249,6 +249,11 @@ void ota_start(Deployment* deployment, ModelStore* store, const OtaConfig& cfg) 
   g_cfg = cfg;
   Serial.printf("[OTA] ENABLED interval=%lus tls=%s manifest=%s\n", (unsigned long)cfg.interval_s,
                 cfg.tls_insecure ? "INSECURE" : "verified", cfg.manifest_url);
+  // The TLS handshake (certificate-chain signature checks) is CPU-bound for well over the task
+  // watchdog's 5 s in the Wokwi simulator (CPU capped at ~8 MHz), starving core 0's idle task and
+  // aborting the firmware. Stop the watchdog from checking IDLE0; the WiFi stack runs at a higher
+  // priority on core 0, so it is unaffected.
+  disableCore0WDT();
   // Core 0: the Arduino loop (serial commands) keeps running on core 1 during downloads.
   xTaskCreatePinnedToCore(ota_task, "ota", 16384, nullptr, 1, &g_task, 0);
 }
