@@ -75,7 +75,7 @@ sim:  ## run firmware on the Wokwi ESP32 simulator (needs WOKWI_CLI_TOKEN)
 	cd .. && $(MAKE) --no-print-directory sim-report
 
 sim-report:  ## parse the simulator serial log into a pass/fail report
-	$(PYTHON) tests/serial_hil_verifier.py --parse-log $(SIM_LOG) --summary-md artifacts/sim_report.md
+	$(PYTHON) tests/serial_hil_verifier.py --parse-log $(SIM_LOG) --target sim --summary-md artifacts/sim_report.md
 
 hil:  ## stream golden (+EXTRA) MNIST frames to a device: make hil PORT=COM5 EXTRA=100
 	$(PYTHON) tests/serial_hil_verifier.py --port $(PORT) --extra $(EXTRA)

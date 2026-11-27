@@ -11,14 +11,18 @@ name: TinyMLOps MNIST ESP32 HIL
 version: 1
 author: CDS 303 TinyMLOps
 
+#
+# NOTE: wait-serial only sees output that arrives while that step is active, so every
+# wait must come BEFORE any delay that the matching line could be printed during.
+# (Model integrity is checked by the log parser, not here.)
 steps:
   # 1) Boot + model bring-up
-  - wait-serial: "[TELEMETRY] MODEL_INTEGRITY=OK"
   - wait-serial: "[TELEMETRY] ARENA_USED="
 
   # 2) Built-in self test on all 10 golden digits must pass 10/10
   - wait-serial: "[TINYMLOPS_TEST_SUMMARY] PASSED=10/10"
   - wait-serial: "[STATUS] BIST PASSED"
+  - wait-serial: "[TINYMLOPS_READY]"
 
   # 3) Status LED on GPIO2 must be held ON after the pass blink pattern
   - delay: 500ms
@@ -28,7 +32,6 @@ steps:
       value: 1
 
   # 4) Interactive UART protocol: liveness + on-demand inference over serial
-  - wait-serial: "[TINYMLOPS_READY]"
   - write-serial: "PING\n"
   - wait-serial: "PONG"
   - write-serial: "SELFTEST:7\n"

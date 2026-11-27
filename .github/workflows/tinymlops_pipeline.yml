@@ -177,7 +177,7 @@ jobs:
           LOG=firmware_esp32/sim_serial.log
           [ -f "$LOG" ] || LOG=sim_serial.log
           python tests/serial_hil_verifier.py --parse-log "$LOG" \
-            --summary-md artifacts/sim_report.md --json-out artifacts/sim_report.json
+            --target sim --summary-md artifacts/sim_report.md --json-out artifacts/sim_report.json
           rc=$?
           cat artifacts/sim_report.md >> "$GITHUB_STEP_SUMMARY"
           exit $rc

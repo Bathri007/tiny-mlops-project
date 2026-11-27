@@ -244,7 +244,13 @@ def live(cfg, args) -> int:
 # --------------------------------------------------------------------------- #
 # Simulation / device log parser
 # --------------------------------------------------------------------------- #
+TAG_RE = re.compile(r"(?<!^)(?<!\n)(?=\[(?:TELEMETRY|TINYMLOPS_[A-Z_]+|STATUS|BIST|WARN)\])")
+
+
 def parse_log(text: str) -> Dict[str, Any]:
+    # Simulator/UART captures occasionally lose a newline ("...=OK[TELEMETRY] HEAP_..."):
+    # put every known tag back on its own line before parsing.
+    text = TAG_RE.sub("\n", text)
     res: Dict[str, Any] = {"rows": [], "telemetry": {}, "fatal": [], "summary": None}
     for line in text.splitlines():
         line = line.strip()
@@ -279,7 +285,8 @@ def render_markdown(res: Dict[str, Any], cfg: Dict[str, Any], ok: bool) -> str:
         "|---|---|",
         f"| BIST | {s.get('passed', 0)}/{s.get('total', 10)} digits ({s.get('accuracy', 0):.2f}%) |",
         f"| Bit-exact parity vs. host TFLite | {t.get('BITEXACT', 'n/a')} |",
-        f"| Avg / min / max latency | {s.get('avg_latency_us', 0):.1f} / {t.get('MIN_US', 'n/a')} / {t.get('MAX_US', 'n/a')} us |",
+        f"| Avg / min / max latency{' (simulated, not cycle-accurate)' if res.get('target') == 'sim' else ''} | "
+        f"{s.get('avg_latency_us', 0):.1f} / {t.get('MIN_US', 'n/a')} / {t.get('MAX_US', 'n/a')} us |",
         f"| Tensor arena used | {arena:,} / {hw['tensor_arena_bytes']:,} B ({100 * arena / hw['tensor_arena_bytes']:.1f}%) |",
         f"| Model size / SHA-256 | {t.get('MODEL_BYTES', 'n/a')} B / `{t.get('MODEL_SHA256_EMBEDDED', 'n/a')[:16]}...` |",
         f"| Model integrity (on-device SHA-256) | {t.get('MODEL_INTEGRITY', 'n/a')} |",
@@ -293,6 +300,9 @@ def render_markdown(res: Dict[str, Any], cfg: Dict[str, Any], ok: bool) -> str:
         out += [f"| {r['digit']} | {r['expected']} | {r['predicted']} | {r['confidence']:.2f}% | "
                 f"{r['latency_us']} | {r['parity']} | {'PASS' if r['status'] == 'PASS' else 'FAIL'} |"
                 for r in res["rows"]]
+    if res.get("checks"):
+        out += ["", "| Check | Result |", "|---|---|"]
+        out += [f"| {name} | {'✅ PASS' if passed else '❌ FAIL'} |" for name, passed in res["checks"].items()]
     if res["fatal"]:
         out += ["", "### Fatal errors", "```"] + res["fatal"] + ["```"]
     return "\n".join(out) + "\n"
@@ -304,10 +314,21 @@ def parse_log_mode(cfg, args) -> int:
         print(f"[error] log file {path} not found")
         return 2
     res = parse_log(path.read_text(encoding="utf-8", errors="replace"))
-    s = res["summary"]
-    ok = (not res["fatal"] and s is not None and s["passed"] == s["total"] == 10
-          and s["avg_latency_us"] <= cfg["hardware"]["max_avg_latency_us"]
-          and s["arena_bytes"] <= cfg["hardware"]["tensor_arena_bytes"])
+    s, t, hw = res["summary"], res["telemetry"], cfg["hardware"]
+    budget = hw["sim_max_avg_latency_us"] if args.target == "sim" else hw["max_avg_latency_us"]
+    checks = {
+        "no FATAL / Guru Meditation": not res["fatal"],
+        "BIST summary present and 10/10": s is not None and s["passed"] == s["total"] == 10,
+        "bit-exact parity 10/10": t.get("BITEXACT") == "10/10",
+        "on-device model SHA-256 integrity OK": t.get("MODEL_INTEGRITY") == "OK",
+        f"avg latency <= {budget:,} us ({args.target} budget)": s is not None and s["avg_latency_us"] <= budget,
+        f"arena <= {hw['tensor_arena_bytes']:,} B": s is not None and s["arena_bytes"] <= hw["tensor_arena_bytes"],
+    }
+    for name, passed in checks.items():
+        print(f"[check] {'PASS' if passed else 'FAIL'}  {name}")
+    ok = all(checks.values())
+    res["checks"] = checks
+    res["target"] = args.target
     md = render_markdown(res, cfg, ok)
     print(md)
     if args.summary_md:
@@ -332,8 +353,13 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--reset", action="store_true", help="toggle RTS to reset a real dev board")
     ap.add_argument("--summary-md", help="(parse-log) write Markdown report here")
     ap.add_argument("--json-out", help="(parse-log) write parsed JSON here")
+    ap.add_argument("--target", choices=["device", "sim"], default="device",
+                    help="(parse-log) which latency budget applies: real hardware or Wokwi simulation")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):  # Windows consoles default to cp1252 (no ✅/❌)
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     cfg = load_cfg()
     if args.parse_log:
         return parse_log_mode(cfg, args)

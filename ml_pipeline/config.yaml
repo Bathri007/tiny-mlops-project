@@ -70,4 +70,8 @@ hardware:
   flash_bytes: 4194304                 # 4 MB
   sram_bytes: 532480                   # 520 KB
   tensor_arena_bytes: 32768            # must match kTensorArenaSize in main.cpp
-  max_avg_latency_us: 100000           # HIL latency budget per inference (100 ms)
+  max_avg_latency_us: 100000           # real-hardware latency budget per inference (100 ms)
+  # Wokwi is not cycle-accurate: its simulated esp_timer reports ~1 s per inference for
+  # this model, so simulated latency is reported but only sanity-checked against a loose
+  # ceiling (catches hangs/regressions). Real latency must be measured with `make hil` on a board.
+  sim_max_avg_latency_us: 3000000

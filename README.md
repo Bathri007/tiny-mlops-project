@@ -124,7 +124,7 @@ These numbers come from a local run on Windows 11 with Python 3.12.10, TF 2.16.2
 | Firmware flash | 373,853 B = 8.91% of 4 MB (28.5% of the 1.25 MB app partition) |
 | Firmware static RAM | 59,680 B = 11.21% of 520 KB (18.2% of 320 KB DRAM), including the 32 KB tensor arena |
 
-**Not yet verified locally:** `make sim` and `make hil` (Wokwi). They need a `WOKWI_CLI_TOKEN`, which this machine didn't have. That means the on-device BIST output, arena usage, latency, bit-exact device parity, and the `test_scenario.yaml` steps (`write-serial` and the GPIO2 `expect-pin` check) have not been run yet. They run in CI once the secret is added, or locally with the token set.
+**Wokwi simulation (from the GitHub Actions run):** the virtual ESP32 boots, recomputes the model's SHA-256 on the device (`MODEL_INTEGRITY=OK`), uses **11,108 of 32,768 B** of tensor arena (33.9%), passes the BIST **10/10**, and matches the host TFLite logits **bit for bit on all 10 digits** (`BITEXACT=10/10`). Simulated latency is about **968 ms per inference**. Wokwi isn't cycle-accurate, so that number is reported but not treated as a hardware measurement: simulation is only checked against a loose 3 s ceiling (`hardware.sim_max_avg_latency_us`), and the 100 ms budget applies to `make hil` on a real board. Real-board latency hasn't been measured yet.
 
 ## 7. Firmware serial protocol (115200 8N1, newline-terminated)
 

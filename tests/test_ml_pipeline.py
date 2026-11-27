@@ -380,5 +380,9 @@ def test_log_parser_detects_pass_and_failures():
     assert r["summary"] == {"passed": 10, "total": 10, "accuracy": 100.0, "avg_latency_us": 1420.5, "arena_bytes": 11264}
     assert r["rows"][0]["predicted"] == 7 and not r["fatal"]
     assert r["telemetry"]["BITEXACT"] == "10/10"
+    # real Wokwi capture lost a newline between two telemetry lines
+    merged = parse_log("[TELEMETRY] MODEL_INTEGRITY=OK[TELEMETRY] HEAP_TOTAL=337232 HEAP_FREE_BEFORE_ALLOC=308328\n")
+    assert merged["telemetry"]["MODEL_INTEGRITY"] == "OK"
+    assert merged["telemetry"]["HEAP_TOTAL"] == "337232"
     bad = parse_log("[TINYMLOPS_FATAL] AllocateTensors() failed\nGuru Meditation Error: Core 1 panic'ed")
     assert len(bad["fatal"]) == 2 and bad["summary"] is None
