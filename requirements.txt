@@ -1,10 +1,9 @@
 # TinyMLOps MNIST -> ESP32 : pinned Python toolchain (tested on CPython 3.11 / 3.12)
 # Install:  python -m pip install -r requirements.txt
 
-# --- ML: training, QAT, TFLite conversion -----------------------------------
+# --- ML: teacher/student training, distillation, TFLite conversion ----------
 tensorflow==2.16.2
-tf-keras==2.16.0                      # Keras 2 (TF_USE_LEGACY_KERAS=1) required by tfmot QAT
-tensorflow-model-optimization==0.8.0
+tf-keras==2.16.0                      # Keras 2 (TF_USE_LEGACY_KERAS=1): custom Distiller train_step + .h5 import
 numpy==1.26.4
 
 # --- MLOps: experiment tracking & data/model versioning ---------------------

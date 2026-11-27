@@ -200,6 +200,25 @@ def live(cfg, args) -> int:
             print("[error] device did not answer PING")
             return 2
 
+        # Stale-firmware guard: the device must be running the same model the host compares against.
+        import hashlib
+
+        host_sha = hashlib.sha256(model_path(cfg).read_bytes()).hexdigest()
+        ser.write(b"INFO\n")
+        info = read_until(ser, lambda l: "MODEL_SHA256_EMBEDDED=" in l, 10.0)
+        dev_sha = info.split("=", 1)[1].strip() if info else None
+        read_until(ser, lambda l: l.startswith("-----"), 3.0)  # drain the rest of the INFO block
+        if dev_sha is None:
+            print("[warn] could not read the device's model SHA-256 (INFO) - continuing")
+        elif dev_sha != host_sha:
+            print(f"[error] STALE FIRMWARE: device runs model {dev_sha[:16]}..., host expects "
+                  f"{host_sha[:16]}... ({model_path(cfg).name}).\n"
+                  f"        Rebuild and re-flash/re-start: pio run -d firmware_esp32"
+                  f"{' -t upload' if args.target == 'device' else '  (then restart the Wokwi simulator)'}")
+            return 1
+        else:
+            print(f"[hil] device model SHA-256 matches host ({host_sha[:16]}...)")
+
         samples = [(f"golden[{i}]", np.array(v["image_int8"], dtype=np.int8), v["label"])
                    for i, v in enumerate(gold["vectors"])]
         if args.extra:
@@ -232,8 +251,11 @@ def live(cfg, args) -> int:
         print("+--------------+-------+------+------+-------------+--------+")
 
     n = len(samples)
-    budget = int(cfg["hardware"]["max_avg_latency_us"])
+    hw = cfg["hardware"]
+    budget = int(hw["sim_max_avg_latency_us"] if args.target == "sim" else hw["max_avg_latency_us"])
     avg = statistics.mean(lat)
+    if args.target == "sim":
+        print("[hil] target=sim: Wokwi timing is not cycle-accurate - latency is a sanity check only")
     print(f"[HIL_SUMMARY] SAMPLES={n} BITEXACT={exact}/{n} DEVICE_ACCURACY={100 * correct / n:.2f}% "
           f"AVG_LATENCY_US={avg:.1f} P95_LATENCY_US={np.percentile(lat, 95):.0f} BUDGET_US={budget}")
     ok = exact == n and avg <= budget
@@ -353,10 +375,13 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--reset", action="store_true", help="toggle RTS to reset a real dev board")
     ap.add_argument("--summary-md", help="(parse-log) write Markdown report here")
     ap.add_argument("--json-out", help="(parse-log) write parsed JSON here")
-    ap.add_argument("--target", choices=["device", "sim"], default="device",
-                    help="(parse-log) which latency budget applies: real hardware or Wokwi simulation")
+    ap.add_argument("--target", choices=["device", "sim"], default=None,
+                    help="which latency budget applies: real hardware or Wokwi simulation "
+                         "(default: sim for rfc2217:// ports, device otherwise)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
+    if args.target is None:
+        args.target = "sim" if (args.port or "").startswith("rfc2217://") else "device"
     for stream in (sys.stdout, sys.stderr):  # Windows consoles default to cp1252 (no ✅/❌)
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")

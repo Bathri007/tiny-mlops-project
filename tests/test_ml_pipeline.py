@@ -37,7 +37,7 @@ import export_to_cpp as codegen  # noqa: E402
 
 CFG = gate.load_config()
 INT8_MODEL = REPO / CFG["paths"]["int8_tflite"]
-FP32_MODEL = REPO / CFG["paths"]["baseline_tflite"]
+FP32_MODEL = REPO / CFG["paths"]["fp32_tflite"]
 GOLDEN = REPO / CFG["paths"]["golden_vectors_json"]
 MODEL_H = REPO / CFG["paths"]["model_header"]
 VECTORS_H = REPO / CFG["paths"]["vectors_header"]
@@ -133,28 +133,74 @@ def test_preprocess_shapes_dtype_and_range():
 
 
 @needs_tf
-def test_model_architecture_matches_spec():
+def test_teacher_and_student_architectures_match_assignment():
     import train_and_quantize as tq
 
-    m = tq.build_model(CFG)
-    kinds = [type(layer).__name__ for layer in m.layers]
-    assert kinds == ["Conv2D", "MaxPooling2D", "Flatten", "Dense"]
-    assert m.input_shape == (None, 28, 28, 1)
-    assert m.output_shape == (None, 10)
-    assert m.layers[0].filters == 12 and m.layers[0].kernel_size == (3, 3)
-    # conv: 12*(3*3*1+1)=120 ; dense: 13*13*12*10+10 = 20290
-    assert m.count_params() == 120 + 20290
+    teacher, student = tq.build_teacher(CFG), tq.build_student(CFG)
+    assert teacher.count_params() == 503_690          # Assignment 4 teacher
+    assert student.count_params() == 14_410           # Assignment 4 student (deployed)
+    assert [type(l).__name__ for l in student.layers] == [
+        "Conv2D", "MaxPooling2D", "Conv2D", "MaxPooling2D", "Flatten", "Dense", "Dense"]
+    for m in (teacher, student):
+        assert m.input_shape == (None, 28, 28, 1) and m.output_shape == (None, 10)
+        assert m.layers[-1].activation.__name__ == "linear"   # logits, no softmax
+    with pytest.raises(ValueError):
+        tq.build_from_spec([{"type": "lstm"}], CFG, "bad")
 
 
 @needs_tf
-def test_representative_dataset_is_deterministic_and_sized():
+def test_distiller_train_step_updates_only_the_student():
+    import train_and_quantize as tq
+
+    tq.set_seeds(0)
+    teacher, student = tq.build_teacher(CFG), tq.build_student(CFG)
+    t_before = [w.copy() for w in teacher.get_weights()]
+    s_before = [w.copy() for w in student.get_weights()]
+    d = tq.Distiller(student, teacher, alpha=0.1, temperature=5)
+    d.compile(optimizer=tq.keras.optimizers.Adam(1e-3), metrics=["accuracy"])
+    x = np.random.default_rng(0).random((16, 28, 28, 1), dtype=np.float32)
+    y = np.arange(16) % 10
+    hist = d.fit(x, y, epochs=1, batch_size=8, verbose=0).history
+    assert {"accuracy", "student_loss", "distill_loss"} <= set(hist)
+    assert all(np.array_equal(a, b) for a, b in zip(t_before, teacher.get_weights()))  # teacher frozen
+    assert any(not np.array_equal(a, b) for a, b in zip(s_before, student.get_weights()))
+
+
+@needs_tf
+def test_teacher_cache_key_tracks_teacher_config_only():
+    import copy
+    import train_and_quantize as tq
+
+    k = tq.teacher_cache_key(CFG)
+    other = copy.deepcopy(CFG)
+    other["distillation"]["temperature"] = 9          # student-side change: teacher reusable
+    assert tq.teacher_cache_key(other) == k
+    other["training"]["teacher"]["epochs"] = 1         # teacher change: must retrain
+    assert tq.teacher_cache_key(other) != k
+
+
+@needs_tf
+def test_import_rejects_a_model_that_is_not_the_configured_student(tmp_path):
+    import argparse
+    import train_and_quantize as tq
+
+    wrong = tq.build_teacher(CFG)                     # teacher weights cannot load into the student
+    wrong.save(tmp_path / "wrong.h5", include_optimizer=False)
+    x = np.zeros((4, 28, 28, 1), np.float32)
+    y = np.zeros(4, np.int64)
+    args = argparse.Namespace(import_h5=str(tmp_path / "wrong.h5"), import_tflite=None)
+    with pytest.raises(SystemExit):
+        tq.import_mode(CFG, args, ((x, y), (x, y)))
+
+
+@needs_tf
+def test_representative_dataset_uses_first_n_training_images():
     import train_and_quantize as tq
 
     x = np.random.default_rng(1).random((500, 28, 28, 1), dtype=np.float32)
-    a = [s[0] for s in tq.make_representative_dataset(x, 100, seed=42)()]
-    b = [s[0] for s in tq.make_representative_dataset(x, 100, seed=42)()]
-    assert len(a) == 100 and a[0].shape == (1, 28, 28, 1)
-    assert all(np.array_equal(p, q) for p, q in zip(a, b))
+    a = [s[0] for s in tq.make_representative_dataset(x, 200)()]
+    assert len(a) == 200 and a[0].shape == (1, 28, 28, 1)
+    assert np.array_equal(a[0][0], x[0]) and np.array_equal(a[-1][0], x[199])
 
 
 def test_config_hardware_budget_is_consistent():

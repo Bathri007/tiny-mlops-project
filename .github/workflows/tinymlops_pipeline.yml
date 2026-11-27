@@ -1,8 +1,9 @@
 # =============================================================================
-#  TinyMLOps CI/CD : Train -> Quantize -> Quality Gates -> C++ Codegen ->
-#                    PlatformIO build -> Wokwi ESP32 HIL simulation -> Report
+#  TinyMLOps CI/CD : Teacher -> Knowledge-distilled student -> INT8 PTQ ->
+#                    Quality Gates -> C++ Codegen -> PlatformIO build ->
+#                    Wokwi ESP32 HIL simulation -> Report
 # =============================================================================
-name: TinyMLOps MNIST ESP32 Pipeline
+name: TinyMLOps KD Student MNIST ESP32 Pipeline
 
 on:
   push:
@@ -10,6 +11,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      model_source:
+        description: "train = distill in CI; colab_import = deploy the exact Colab model in models/colab/"
+        type: choice
+        options: [train, colab_import]
+        default: train
 
 concurrency:
   group: tinymlops-${{ github.ref }}
@@ -27,9 +34,11 @@ env:
 jobs:
   # ---------------------------------------------------------------------------
   ml-train-and-gate:
-    name: "1 · Train, quantize, gate, codegen"
+    name: "1 · Distill, quantize, gate, codegen"
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
+    env:
+      MODEL_SOURCE: ${{ inputs.model_source || 'train' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -50,8 +59,29 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Stage 1 · Train FP32 baseline + QAT INT8
+      - name: Teacher cache key (hash of teacher architecture + training config)
+        id: teacher
+        run: |
+          key=$(python -c "import sys; sys.path.insert(0,'ml_pipeline'); import train_and_quantize as t; print(t.teacher_cache_key(t.load_config()))" 2>/dev/null | tail -1)
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "teacher cache key: $key"
+
+      - name: Cache trained teacher
+        if: env.MODEL_SOURCE == 'train'
+        uses: actions/cache@v4
+        with:
+          path: artifacts/teacher_cache
+          key: teacher-${{ steps.teacher.outputs.key }}
+
+      - name: Stage 1 · Teacher -> baseline student -> KD student -> INT8 PTQ
+        if: env.MODEL_SOURCE == 'train'
         run: python ml_pipeline/train_and_quantize.py
+
+      - name: Stage 1 · Import exact Colab KD student (models/colab/)
+        if: env.MODEL_SOURCE == 'colab_import'
+        run: |
+          python ml_pipeline/train_and_quantize.py \
+            --import-h5 models/colab/student_kd.h5 --import-tflite models/colab/student_kd_int8.tflite
 
       - name: Stage 2 · Quality gates (flash / accuracy / operators / quantization)
         run: python ml_pipeline/evaluate_and_gate.py
@@ -73,8 +103,19 @@ jobs:
           m = json.loads(pathlib.Path("artifacts/metrics.json").read_text())
           g = json.loads(pathlib.Path("artifacts/gate_report.json").read_text())
           gm = g["metrics"]
-          print("## TinyMLOps · Model Training & Quality Gates\n")
-          print("| Metric | FP32 baseline | QAT INT8 |\n|---|---|---|")
+          print("## TinyMLOps · Knowledge Distillation & Quality Gates\n")
+          print(f"**Model source:** `{g.get('model_source', 'n/a')}`\n")
+          kd = g.get("kd", {})
+          if kd:
+              print("| Model (Keras FP32) | Test accuracy |\n|---|---|")
+              for k, label in [("teacher_keras_test_accuracy", "Teacher CNN (503,690 params)"),
+                               ("baseline_student_keras_test_accuracy", "Baseline student, labels only (14,410 params)"),
+                               ("kd_student_keras_test_accuracy", "KD student (14,410 params)")]:
+                  if k in kd:
+                      print(f"| {label} | {100*kd[k]:.2f}% |")
+              if "kd_gain_vs_baseline_student" in kd:
+                  print(f"\n**KD gain vs baseline student:** {100*kd['kd_gain_vs_baseline_student']:+.2f} pp\n")
+          print("| Deployed KD student | FP32 TFLite | INT8 TFLite (ESP32) |\n|---|---|---|")
           print(f"| TFLite test accuracy (10k) | {100*gm['fp32_tflite_accuracy']:.2f}% | {100*gm['int8_tflite_accuracy']:.2f}% |")
           print(f"| Model size | {gm['fp32_model_bytes']:,} B | {gm['int8_model_bytes']:,} B |")
           print(f"| Compression | 1.00x | {gm['fp32_model_bytes']/gm['int8_model_bytes']:.2f}x |")
@@ -92,8 +133,8 @@ jobs:
           name: tinyml-model
           if-no-files-found: warn
           path: |
-            artifacts/baseline_fp32.tflite
-            artifacts/model_qat_int8.tflite
+            artifacts/kd_student_fp32.tflite
+            artifacts/kd_student_int8.tflite
             artifacts/metrics.json
             artifacts/gate_report.json
             artifacts/golden_vectors.json

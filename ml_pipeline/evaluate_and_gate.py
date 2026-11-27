@@ -5,7 +5,7 @@ Stage 2 of the TinyMLOps pipeline: automated deployment quality gates.
 Gates (all thresholds come from config.yaml, CLI flags may override them):
   * QUANT   : the INT8 model has int8 input AND int8 output tensors with a valid
               (scale > 0, -128 <= zero_point <= 127) per-tensor quantization.
-  * FLASH   : model_qat_int8.tflite <= gates.max_model_bytes.
+  * FLASH   : kd_student_int8.tflite <= gates.max_model_bytes.
   * ACCURACY: INT8 accuracy on all 10,000 MNIST test images >= gates.min_int8_accuracy
               AND (FP32 accuracy - INT8 accuracy) <= gates.max_accuracy_drop.
   * OPS     : every operator in the flatbuffer is in gates.allowed_ops (i.e. is
@@ -316,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-accuracy", type=float, help="override gates.min_int8_accuracy (0..1)")
     ap.add_argument("--max-drop", type=float, help="override gates.max_accuracy_drop (0..1)")
     ap.add_argument("--limit", type=int, default=None, help="evaluate only the first N test images (fast smoke test)")
-    ap.add_argument("--fp32-model", help="override path to baseline FP32 .tflite")
+    ap.add_argument("--fp32-model", help="override path to the FP32 KD student .tflite")
     ap.add_argument("--int8-model", help="override path to INT8 .tflite")
     ap.add_argument("--report-out", help="override gate report JSON path")
     ap.add_argument("--golden-out", help="override golden vectors JSON path")
@@ -329,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
     min_acc = args.min_accuracy if args.min_accuracy is not None else float(g["min_int8_accuracy"])
     max_drop = args.max_drop if args.max_drop is not None else float(g["max_accuracy_drop"])
 
-    fp32_path = Path(args.fp32_model) if args.fp32_model else resolve(cfg["paths"]["baseline_tflite"])
+    fp32_path = Path(args.fp32_model) if args.fp32_model else resolve(cfg["paths"]["fp32_tflite"])
     int8_path = Path(args.int8_model) if args.int8_model else resolve(cfg["paths"]["int8_tflite"])
     report_path = Path(args.report_out) if args.report_out else resolve(cfg["paths"]["gate_report_json"])
     golden_path = Path(args.golden_out) if args.golden_out else resolve(cfg["paths"]["golden_vectors_json"])
@@ -398,6 +398,17 @@ def main(argv: list[str] | None = None) -> int:
         "gates": [asdict(r) for r in results],
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+
+    # Knowledge-distillation context from Stage 1 (informational, not a gate: the KD gain
+    # on MNIST is small and varies run to run, so it must not block a deployment).
+    metrics_path = resolve(cfg["paths"]["metrics_json"])
+    if metrics_path.exists():
+        stage1 = json.loads(metrics_path.read_text(encoding="utf-8"))
+        report["model_source"] = stage1.get("params", {}).get("model_source", "unknown")
+        report["kd"] = {k: v for k, v in stage1.get("metrics", {}).items()
+                        if k.startswith(("teacher_keras", "baseline_student_keras", "kd_student_keras", "kd_gain"))}
+        if report["kd"]:
+            print("[kd] " + " | ".join(f"{k}={100 * v:.2f}{'pp' if 'gain' in k else '%'}" for k, v in report["kd"].items()))
 
     if passed:
         idx = select_golden_vectors(q_images, y_test, int8_pred)

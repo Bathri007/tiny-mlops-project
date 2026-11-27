@@ -1,7 +1,10 @@
 # DVC pipeline: `dvc repro` re-runs only the stages whose deps/params changed.
 #   dvc dag            -> visualise   prepare_train -> evaluate_gate -> codegen_cpp
-#   dvc metrics show   -> FP32 / INT8 accuracy, sizes, gate results
+#   dvc metrics show   -> teacher / baseline student / KD student accuracy, sizes, gates
 #   dvc params diff    -> what hyperparameters changed vs. the last commit
+# prepare_train distills the student in the pipeline (teacher cached in
+# artifacts/teacher_cache). To deploy the exact Colab model instead, run
+# `make import-colab` (outside DVC) followed by `make gate codegen`.
 stages:
   prepare_train:
     cmd: python ml_pipeline/train_and_quantize.py
@@ -11,12 +14,13 @@ stages:
       - ml_pipeline/config.yaml:
           - project.seed
           - data
-          - model
+          - models
           - training
+          - distillation
           - quantization
     outs:
-      - artifacts/baseline_fp32.tflite
-      - artifacts/model_qat_int8.tflite
+      - artifacts/kd_student_fp32.tflite
+      - artifacts/kd_student_int8.tflite
     metrics:
       - artifacts/metrics.json:
           cache: false
@@ -25,8 +29,8 @@ stages:
     cmd: python ml_pipeline/evaluate_and_gate.py
     deps:
       - ml_pipeline/evaluate_and_gate.py
-      - artifacts/baseline_fp32.tflite
-      - artifacts/model_qat_int8.tflite
+      - artifacts/kd_student_fp32.tflite
+      - artifacts/kd_student_int8.tflite
     params:
       - ml_pipeline/config.yaml:
           - gates
@@ -40,7 +44,7 @@ stages:
     cmd: python ml_pipeline/export_to_cpp.py
     deps:
       - ml_pipeline/export_to_cpp.py
-      - artifacts/model_qat_int8.tflite
+      - artifacts/kd_student_int8.tflite
       - artifacts/golden_vectors.json
       - artifacts/gate_report.json
     outs:

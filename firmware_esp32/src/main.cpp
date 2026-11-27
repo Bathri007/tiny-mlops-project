@@ -1,5 +1,6 @@
 // =============================================================================
-//  TinyMLOps MNIST inference firmware - ESP32-WROOM-32 + TensorFlow Lite Micro
+//  TinyMLOps inference firmware - knowledge-distilled MNIST student CNN
+//  (14,410 params, full-INT8) on ESP32-WROOM-32 + TensorFlow Lite Micro
 // =============================================================================
 //  Boot sequence
 //    1. Telemetry  : firmware version, model SHA-256 (embedded vs. recomputed
@@ -179,12 +180,13 @@ void set_led(bool on) { digitalWrite(TINYMLOPS_LED_PIN, on ? HIGH : LOW); }
 void print_telemetry() {
   Serial.println();
   Serial.println("==================================================================");
-  Serial.println(" TinyMLOps | MNIST CNN on ESP32-WROOM-32 | TensorFlow Lite Micro");
+  Serial.println(" TinyMLOps | KD Student MNIST CNN on ESP32-WROOM-32 | TFLite Micro");
   Serial.println("==================================================================");
   Serial.printf("[TELEMETRY] FW_VERSION=%s BUILD=%s %s\n", TINYMLOPS_FW_VERSION, __DATE__, __TIME__);
   Serial.printf("[TELEMETRY] CHIP=%s REV=%d CORES=%d CPU_MHZ=%u FLASH_BYTES=%u\n", ESP.getChipModel(),
                 ESP.getChipRevision(), ESP.getChipCores(), (unsigned)ESP.getCpuFreqMHz(),
                 (unsigned)ESP.getFlashChipSize());
+  Serial.printf("[TELEMETRY] MODEL_NAME=%s\n", kModelName);
   Serial.printf("[TELEMETRY] MODEL_BYTES=%u MODEL_GENERATED=%s\n", g_mnist_model_data_len, kModelGeneratedAt);
   Serial.printf("[TELEMETRY] MODEL_SHA256_EMBEDDED=%s\n", kModelSha256);
   Serial.printf("[TELEMETRY] MODEL_SHA256_RUNTIME =%s\n", g_runtime_sha256);

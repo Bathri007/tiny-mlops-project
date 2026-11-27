@@ -24,7 +24,7 @@ SIM_LOG  := artifacts/sim_serial.log
 PORT     ?= rfc2217://localhost:4000
 EXTRA    ?= 0
 
-.PHONY: help setup train gate gate-fail-demo codegen build-fw fw-size sim sim-report hil host-parity \
+.PHONY: help setup train import-colab gate gate-fail-demo codegen build-fw fw-size sim sim-report hil host-parity \
         flash monitor test test-all mlflow-ui dvc-repro all clean
 
 help:  ## list targets
@@ -38,8 +38,12 @@ _install:
 	$(PYTHON) -m pip install --upgrade pip
 	$(PYTHON) -m pip install -r requirements.txt
 
-train:  ## Stage 1: train FP32 baseline + QAT INT8, log to MLflow
+train:  ## Stage 1: teacher (cached) -> baseline student -> KD student -> INT8 PTQ, log to MLflow
 	$(PYTHON) ml_pipeline/train_and_quantize.py
+
+import-colab:  ## Stage 1 alt: deploy the exact Colab KD student from models/colab/
+	$(PYTHON) ml_pipeline/train_and_quantize.py --import-h5 models/colab/student_kd.h5 \
+	  --import-tflite models/colab/student_kd_int8.tflite
 
 gate:  ## Stage 2: quality gates (flash, accuracy, ops, quant) + golden vectors
 	$(PYTHON) ml_pipeline/evaluate_and_gate.py

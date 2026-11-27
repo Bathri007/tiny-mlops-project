@@ -5,8 +5,8 @@ stages:
     deps:
     - path: ml_pipeline/train_and_quantize.py
       hash: md5
-      md5: c2b2b02464fc91e9de3850f51ba5cbd9
-      size: 11911
+      md5: d4d165af384bd43712d68fa9b0910a82
+      size: 19307
     params:
       ml_pipeline/config.yaml:
         data:
@@ -16,56 +16,81 @@ stages:
           - 28
           - 1
           validation_split: 0.1
-        model:
-          conv_filters: 12
-          conv_kernel:
-          - 3
-          - 3
-          pool_size:
-          - 2
-          - 2
+        distillation:
+          alpha: 0.1
+          temperature: 5
+        models:
+          teacher:
+          - type: conv
+            filters: 32
+          - type: conv
+            filters: 64
+          - type: pool
+          - type: conv
+            filters: 128
+          - type: pool
+          - type: flatten
+          - type: dense
+            units: 128
+          - type: logits
+          student:
+          - type: conv
+            filters: 8
+          - type: pool
+          - type: conv
+            filters: 16
+          - type: pool
+          - type: flatten
+          - type: dense
+            units: 32
+          - type: logits
         project.seed: 42
         quantization:
-          representative_samples: 100
+          method: ptq_full_int8
+          representative_samples: 200
           inference_input_type: int8
           inference_output_type: int8
         training:
-          baseline:
-            batch_size: 32
-            epochs: 2
+          teacher:
+            epochs: 5
+            batch_size: 128
             learning_rate: 0.001
-          qat:
-            batch_size: 32
-            epochs: 2
-            learning_rate: 0.0005
+          baseline_student:
+            epochs: 5
+            batch_size: 128
+            learning_rate: 0.001
+          kd_student:
+            epochs: 5
+            batch_size: 128
+            learning_rate: 0.001
     outs:
-    - path: artifacts/baseline_fp32.tflite
+    - path: artifacts/kd_student_fp32.tflite
       hash: md5
-      md5: 51955496759660ad10fa682e7ec7485d
-      size: 83836
+      md5: e8ca6706e1fdef79492f542e1afa03d2
+      size: 60784
+    - path: artifacts/kd_student_int8.tflite
+      hash: md5
+      md5: 2921c4ff360b571a4204476ccc339dd4
+      size: 18816
     - path: artifacts/metrics.json
       hash: md5
-      md5: 5942278e3aa08c6d0286f1719b879155
-      size: 1039
-    - path: artifacts/model_qat_int8.tflite
-      hash: md5
-      md5: 1f6af6c18a62511da56660afb69ef87b
-      size: 23432
+      md5: 8acf8843ad10026a707509adfe8cf87f
+      size: 1165
   evaluate_gate:
     cmd: python ml_pipeline/evaluate_and_gate.py
     deps:
-    - path: artifacts/baseline_fp32.tflite
+    - path: artifacts/kd_student_fp32.tflite
       hash: md5
-      md5: 51955496759660ad10fa682e7ec7485d
-      size: 83836
-    - path: artifacts/model_qat_int8.tflite
+      md5: e8ca6706e1fdef79492f542e1afa03d2
+      size: 60784
+    - path: artifacts/kd_student_int8.tflite
       hash: md5
-      md5: 1f6af6c18a62511da56660afb69ef87b
-      size: 23432
+      md5: 2921c4ff360b571a4204476ccc339dd4
+      size: 18816
     - path: ml_pipeline/evaluate_and_gate.py
       hash: md5
-      md5: 89a922ab9c5ae644f36993731fcb2873
-      size: 20278
+      md5: 4d27cabb3a71af6dfa85663c1b9ce15b
+      size: 21043
     params:
       ml_pipeline/config.yaml:
         gates:
@@ -82,37 +107,37 @@ stages:
     outs:
     - path: artifacts/gate_report.json
       hash: md5
-      md5: b2351b2d8e660f2e2cdf051e6743ecff
-      size: 1804
+      md5: 2aa682893f07b16940819bfeb467140e
+      size: 2061
     - path: artifacts/golden_vectors.json
       hash: md5
-      md5: d2489ca86e4af7564f01dbc136319268
-      size: 46928
+      md5: 97c7c36e2309ee2497715ac172123d58
+      size: 46908
   codegen_cpp:
     cmd: python ml_pipeline/export_to_cpp.py
     deps:
     - path: artifacts/gate_report.json
       hash: md5
-      md5: b2351b2d8e660f2e2cdf051e6743ecff
-      size: 1804
+      md5: 2aa682893f07b16940819bfeb467140e
+      size: 2061
     - path: artifacts/golden_vectors.json
       hash: md5
-      md5: d2489ca86e4af7564f01dbc136319268
-      size: 46928
-    - path: artifacts/model_qat_int8.tflite
+      md5: 97c7c36e2309ee2497715ac172123d58
+      size: 46908
+    - path: artifacts/kd_student_int8.tflite
       hash: md5
-      md5: 1f6af6c18a62511da56660afb69ef87b
-      size: 23432
+      md5: 2921c4ff360b571a4204476ccc339dd4
+      size: 18816
     - path: ml_pipeline/export_to_cpp.py
       hash: md5
-      md5: 705f02924cbd72eb3561422579b919f6
-      size: 9597
+      md5: f5b5698d19c9e4cac76abcec1ee226bc
+      size: 10335
     outs:
     - path: firmware_esp32/src/model_data.h
       hash: md5
-      md5: 8f6a1b3f181fa0a363e08314a5a2e94d
-      size: 149965
+      md5: 4a45b51ca9d6eb2577dd76c6122530e6
+      size: 120933
     - path: firmware_esp32/src/test_vectors.h
       hash: md5
-      md5: d12d10422ef01591a056c62073e3e055
-      size: 44524
+      md5: 38943d0f5f7606b0e7f07b7f9496a89e
+      size: 44525
