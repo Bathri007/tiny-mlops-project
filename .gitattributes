@@ -1,0 +1,5 @@
+# Keep LF everywhere: Makefile recipes, YAML and shell steps break with CRLF
+* text=auto eol=lf
+*.tflite binary
+*.bin binary
+*.png binary

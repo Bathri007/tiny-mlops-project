@@ -1,0 +1,37 @@
+# Wokwi automation scenario - executed by `wokwi-cli --scenario test_scenario.yaml`
+# (make sim) and by wokwi/wokwi-ci-action in GitHub Actions.
+#
+# Failure handling:
+#   * "Guru Meditation" anywhere in the log -> immediate failure (--fail-text / fail_text)
+#   * AllocateTensors() / Invoke() failure  -> firmware prints [TINYMLOPS_FATAL] and never
+#     prints PASSED=10/10, so the wait-serial step times out and the run fails; the CI log
+#     parser (serial_hil_verifier.py --parse-log) additionally rejects any FATAL line.
+#   * The serial log is saved with --serial-log-file (CI: sim_serial.log artifact).
+name: TinyMLOps MNIST ESP32 HIL
+version: 1
+author: CDS 303 TinyMLOps
+
+steps:
+  # 1) Boot + model bring-up
+  - wait-serial: "[TELEMETRY] MODEL_INTEGRITY=OK"
+  - wait-serial: "[TELEMETRY] ARENA_USED="
+
+  # 2) Built-in self test on all 10 golden digits must pass 10/10
+  - wait-serial: "[TINYMLOPS_TEST_SUMMARY] PASSED=10/10"
+  - wait-serial: "[STATUS] BIST PASSED"
+
+  # 3) Status LED on GPIO2 must be held ON after the pass blink pattern
+  - delay: 500ms
+  - expect-pin:
+      part-id: esp
+      pin: D2
+      value: 1
+
+  # 4) Interactive UART protocol: liveness + on-demand inference over serial
+  - wait-serial: "[TINYMLOPS_READY]"
+  - write-serial: "PING\n"
+  - wait-serial: "PONG"
+  - write-serial: "SELFTEST:7\n"
+  - wait-serial: '{"idx":7,"label":7,"pred":7,'
+  - write-serial: "SELFTEST:3\n"
+  - wait-serial: '{"idx":3,"label":3,"pred":3,'

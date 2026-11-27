@@ -1,0 +1,11 @@
+# Wokwi ESP32 simulator configuration (used by the VS Code extension, wokwi-cli and
+# wokwi/wokwi-ci-action). Paths are relative to this directory (firmware_esp32/).
+[wokwi]
+version = 1
+firmware = ".pio/build/esp32dev/firmware.bin"
+elf = ".pio/build/esp32dev/firmware.elf"
+
+# Exposes the simulated ESP32 UART0 as an RFC2217 serial server while the VS Code
+# Wokwi extension is running, so tests/serial_hil_verifier.py can stream MNIST frames:
+#   python tests/serial_hil_verifier.py --port rfc2217://localhost:4000
+rfc2217ServerPort = 4000
