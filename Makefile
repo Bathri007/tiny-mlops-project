@@ -25,7 +25,7 @@ PORT     ?= rfc2217://localhost:4000
 EXTRA    ?= 0
 
 .PHONY: help setup train import-colab gate gate-fail-demo codegen build-fw fw-size sim sim-report hil host-parity \
-        flash monitor test test-all mlflow-ui dvc-repro all clean
+        flash monitor test test-all mlflow-ui dvc-repro all clean package sim-ota ca-roots
 
 help:  ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-15s\033[0m %s\n",$$1,$$2}'
@@ -77,6 +77,19 @@ sim:  ## run firmware on the Wokwi ESP32 simulator (needs WOKWI_CLI_TOKEN)
 	cd $(FW_DIR) && $(WOKWI) --timeout 120000 --scenario test_scenario.yaml \
 	  --serial-log-file ../$(SIM_LOG) --fail-text "Guru Meditation" .
 	cd .. && $(MAKE) --no-print-directory sim-report
+
+sim-ota:  ## Wokwi ESP32 downloads the latest published model over WiFi (needs a release + WOKWI_CLI_TOKEN)
+	@test -n "$${WOKWI_CLI_TOKEN:-}" || { echo "Set WOKWI_CLI_TOKEN (https://wokwi.com/dashboard/ci)"; exit 2; }
+	mkdir -p artifacts
+	cd $(FW_DIR) && $(WOKWI) --timeout 600000 --scenario test_scenario_ota.yaml \
+	  --serial-log-file ../artifacts/sim_ota_serial.log --fail-text "Guru Meditation" .
+
+package:  ## build a local OTA release package in dist/ (VERSION=n BASE_URL=https://...)
+	$(PYTHON) ml_pipeline/package_model.py --version $${VERSION:-1} \
+	  --base-url $${BASE_URL:-https://github.com/Bathri007/tiny-mlops-project/releases/download/model-v$${VERSION:-1}}
+
+ca-roots:  ## regenerate the root CAs the ESP32 trusts for HTTPS downloads
+	$(PYTHON) firmware_esp32/tools/gen_ca_roots.py
 
 sim-report:  ## parse the simulator serial log into a pass/fail report
 	$(PYTHON) tests/serial_hil_verifier.py --parse-log $(SIM_LOG) --target sim --summary-md artifacts/sim_report.md

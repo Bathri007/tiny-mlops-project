@@ -208,11 +208,16 @@ def test_config_hardware_budget_is_consistent():
     assert hw["tensor_arena_bytes"] == 32 * 1024
     assert g["max_model_bytes"] < hw["flash_bytes"]
     assert set(g["allowed_ops"]) == {"CONV_2D", "MAX_POOL_2D", "RESHAPE", "FULLY_CONNECTED", "QUANTIZE", "DEQUANTIZE"}
-    main_cpp = (REPO / "firmware_esp32" / "src" / "main.cpp").read_text()
-    assert "MicroMutableOpResolver<6>" in main_cpp
+    src = REPO / "firmware_esp32" / "src"
+    runtime_cpp = (src / "model_runtime.cpp").read_text()
+    assert "MicroMutableOpResolver<6>" in runtime_cpp
     for fn in ("AddConv2D", "AddMaxPool2D", "AddReshape", "AddFullyConnected", "AddQuantize", "AddDequantize"):
-        assert f"resolver.{fn}()" in main_cpp
-    assert "AllOpsResolver" not in main_cpp.replace("not AllOpsResolver", "")
+        assert f"r.{fn}()" in runtime_cpp
+    all_src = "".join(p.read_text() for p in src.glob("*.cpp"))
+    assert "AllOpsResolver" not in all_src
+    # The OTA updater rejects models whose ops are not in this list: it must equal the gate's list.
+    m = re.search(r'kSupportedOps\[\] = "([^"]+)"', (src / "main.cpp").read_text())
+    assert m and m.group(1).split(",") == g["allowed_ops"]
 
 
 # =========================================================================== #

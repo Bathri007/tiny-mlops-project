@@ -24,3 +24,9 @@ sim_serial.log
 .DS_Store
 Thumbs.db
 .idea/
+
+# Local WiFi credentials for the ESP32 (see firmware_esp32/src/secrets.example.h)
+firmware_esp32/src/secrets.h
+
+# Release packages built by ml_pipeline/package_model.py
+/dist/

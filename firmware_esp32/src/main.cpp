@@ -1,290 +1,81 @@
 // =============================================================================
 //  TinyMLOps inference firmware - knowledge-distilled MNIST student CNN
-//  (14,410 params, full-INT8) on ESP32-WROOM-32 + TensorFlow Lite Micro
+//  (14,410 params, full-INT8) on ESP32-WROOM-32 + TensorFlow Lite Micro,
+//  with over-the-air (WiFi) MODEL updates from GitHub Releases.
 // =============================================================================
-//  Boot sequence
-//    1. Telemetry  : firmware version, model SHA-256 (embedded vs. recomputed
-//                    on-device), arena usage, free heap before/after
-//                    AllocateTensors().
-//    2. BIST       : runs the 10 golden INT8 MNIST digits from test_vectors.h,
-//                    prints a table + machine-parseable summary line:
+//  Boot
+//    1. Mount LittleFS, read /state.txt, run the active model (slot A/B) or the
+//       factory model compiled into this firmware (model_data.h). A slot model whose
+//       SHA-256 or self-test fails falls back to factory automatically.
+//    2. Telemetry + BIST on the active model's golden vectors, machine-parseable:
 //       [TINYMLOPS_TEST_SUMMARY] PASSED=10/10 ACCURACY=100.00% AVG_LATENCY_US=.. ARENA_BYTES=..
-//                    and blinks the GPIO2 status LED (then holds it ON) on 10/10.
-//    3. Interactive UART mode (115200 8N1, newline-terminated commands):
-//         INFER:<784 int8 values, comma/space separated>  or  INFER:<1568 hex chars>
-//             -> {"pred":7,"score":118,"latency_us":1420,"confidence":99.71,"logits":[..]}
-//         SELFTEST:<0-9>  run one embedded golden vector  -> JSON incl. label & parity
-//         BIST            re-run the full built-in self test
-//         INFO            re-print telemetry
-//         PING            -> PONG
+//       GPIO2 LED: 5 blinks then steady ON when the self-test passes.
+//    3. OTA task (core 0): WiFi -> manifest -> download -> verify -> self-test -> switch
+//       or roll back (see ota_agent.h). Serial keeps working meanwhile (core 1).
+//  Serial commands (115200 8N1, newline-terminated)
+//    INFER:<784 int8 comma/space separated> | INFER:<1568 hex>  -> {"pred":..,"logits":[..]}
+//    SELFTEST:<i>  one golden vector of the active model       -> JSON incl. label & parity
+//    BIST          full self test        INFO   telemetry      PING -> PONG
+//    OTA           check for a new model now   STATUS  OTA + slot status
+//    FACTORY       switch back to the factory model (persists across reboots)
 // =============================================================================
 #include <Arduino.h>
-#include <TensorFlowLite_ESP32.h>
 
-#include <math.h>
 #include <string.h>
 
-#include "esp_system.h"
-#include "esp_timer.h"
-#include "tensorflow/lite/micro/micro_error_reporter.h"
-#include "tensorflow/lite/micro/micro_interpreter.h"
-#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
-#include "tensorflow/lite/schema/schema_generated.h"
-
+#include "deployment.h"
 #include "model_data.h"
+#include "model_runtime.h"
+#include "model_store.h"
+#include "ota_agent.h"
 #include "test_vectors.h"
+
+#if __has_include("secrets.h")
+#include "secrets.h"
+#endif
 
 #ifndef TINYMLOPS_FW_VERSION
 #define TINYMLOPS_FW_VERSION "dev"
 #endif
-#ifndef TINYMLOPS_TENSOR_ARENA_KB
-#define TINYMLOPS_TENSOR_ARENA_KB 32
-#endif
 #ifndef TINYMLOPS_LED_PIN
 #define TINYMLOPS_LED_PIN 2
 #endif
-#ifndef TFLITE_SCHEMA_VERSION
-#define TFLITE_SCHEMA_VERSION 3
+#ifndef TINYMLOPS_BOOT_BUTTON_PIN
+#define TINYMLOPS_BOOT_BUTTON_PIN 0
 #endif
+#ifndef TINYMLOPS_OTA_ENABLED
+#define TINYMLOPS_OTA_ENABLED 1
+#endif
+#ifndef TINYMLOPS_OTA_INTERVAL_S
+#define TINYMLOPS_OTA_INTERVAL_S 300
+#endif
+#ifndef TINYMLOPS_OTA_TLS_INSECURE
+#define TINYMLOPS_OTA_TLS_INSECURE 0
+#endif
+#ifndef TINYMLOPS_OTA_REQUIRE_BITEXACT
+#define TINYMLOPS_OTA_REQUIRE_BITEXACT 1
+#endif
+#ifndef TINYMLOPS_WIFI_SSID
+#define TINYMLOPS_WIFI_SSID "Wokwi-GUEST"  // Wokwi simulator's open network
+#define TINYMLOPS_WIFI_PASSWORD ""
+#endif
+#ifndef TINYMLOPS_MANIFEST_URL
+#define TINYMLOPS_MANIFEST_URL \
+  "https://github.com/Bathri007/tiny-mlops-project/releases/latest/download/manifest.json"
+#endif
+
+using namespace tinymlops;
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// TFLite Micro globals
-// ---------------------------------------------------------------------------
-constexpr int kTensorArenaSize = TINYMLOPS_TENSOR_ARENA_KB * 1024;  // 32 KB
-alignas(16) uint8_t tensor_arena[kTensorArenaSize];
+constexpr char kSupportedOps[] = "CONV_2D,MAX_POOL_2D,RESHAPE,FULLY_CONNECTED,QUANTIZE,DEQUANTIZE";
 
-tflite::MicroErrorReporter micro_error_reporter;
-tflite::ErrorReporter* error_reporter = &micro_error_reporter;
-const tflite::Model* model = nullptr;
-tflite::MicroInterpreter* interpreter = nullptr;
-TfLiteTensor* input = nullptr;
-TfLiteTensor* output = nullptr;
-
-bool g_model_ready = false;
-bool g_integrity_ok = false;
-uint32_t g_heap_before_alloc = 0;
-uint32_t g_heap_after_alloc = 0;
-char g_runtime_sha256[65] = {0};
-
-// ---------------------------------------------------------------------------
-// Minimal SHA-256 (FIPS 180-4) - verifies the flatbuffer in flash matches the
-// hash stamped by the CI pipeline, without depending on HW crypto peripherals.
-// ---------------------------------------------------------------------------
-constexpr uint32_t kSha256K[64] = {
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
-
-inline uint32_t rotr(uint32_t x, uint32_t n) { return (x >> n) | (x << (32 - n)); }
-
-void sha256_block(uint32_t h[8], const uint8_t blk[64]) {
-  uint32_t w[64];
-  for (int i = 0; i < 16; ++i) {
-    w[i] = (uint32_t)blk[4 * i] << 24 | (uint32_t)blk[4 * i + 1] << 16 | (uint32_t)blk[4 * i + 2] << 8 |
-           (uint32_t)blk[4 * i + 3];
-  }
-  for (int i = 16; i < 64; ++i) {
-    uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
-    uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
-    w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-  }
-  uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
-  for (int i = 0; i < 64; ++i) {
-    uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
-    uint32_t ch = (e & f) ^ (~e & g);
-    uint32_t t1 = hh + S1 + ch + kSha256K[i] + w[i];
-    uint32_t S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
-    uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
-    uint32_t t2 = S0 + maj;
-    hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
-  }
-  h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
-}
-
-void sha256_hex(const uint8_t* data, size_t len, char out_hex[65]) {
-  uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-                   0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
-  size_t full = len / 64;
-  for (size_t i = 0; i < full; ++i) sha256_block(h, data + 64 * i);
-  uint8_t tail[128] = {0};
-  size_t rem = len - full * 64;
-  memcpy(tail, data + full * 64, rem);
-  tail[rem] = 0x80;
-  size_t tail_len = (rem < 56) ? 64 : 128;
-  uint64_t bits = (uint64_t)len * 8;
-  for (int i = 0; i < 8; ++i) tail[tail_len - 1 - i] = (uint8_t)(bits >> (8 * i));
-  sha256_block(h, tail);
-  if (tail_len == 128) sha256_block(h, tail + 64);
-  for (int i = 0; i < 8; ++i) snprintf(out_hex + 8 * i, 9, "%08x", (unsigned)h[i]);
-  out_hex[64] = '\0';
-}
-
-// ---------------------------------------------------------------------------
-// Inference helpers
-// ---------------------------------------------------------------------------
-struct InferenceResult {
-  int pred;
-  int8_t score;        // raw int8 logit of the winning class
-  float confidence;    // softmax(dequantized logits)[pred] in %
-  int64_t latency_us;  // Invoke() wall time
-  int8_t logits[kNumClasses];
-  bool ok;
-};
-
-InferenceResult run_inference(const int8_t* image) {
-  InferenceResult r{};
-  memcpy(input->data.int8, image, kImageSize);
-  const int64_t t0 = esp_timer_get_time();
-  TfLiteStatus st = interpreter->Invoke();
-  r.latency_us = esp_timer_get_time() - t0;
-  r.ok = (st == kTfLiteOk);
-  if (!r.ok) return r;
-
-  const float out_scale = output->params.scale;
-  const int out_zp = output->params.zero_point;
-  int best = 0;
-  for (int i = 0; i < kNumClasses; ++i) {
-    r.logits[i] = output->data.int8[i];
-    if (r.logits[i] > r.logits[best]) best = i;
-  }
-  float max_logit = (r.logits[best] - out_zp) * out_scale;
-  float denom = 0.f;
-  for (int i = 0; i < kNumClasses; ++i) denom += expf((r.logits[i] - out_zp) * out_scale - max_logit);
-  r.pred = best;
-  r.score = r.logits[best];
-  r.confidence = 100.f / denom;
-  return r;
-}
-
-void print_logits_json(const int8_t* logits) {
-  Serial.print("[");
-  for (int i = 0; i < kNumClasses; ++i) {
-    Serial.print(logits[i]);
-    if (i + 1 < kNumClasses) Serial.print(",");
-  }
-  Serial.print("]");
-}
+ModelRuntime g_runtime;
+ModelStore g_store;
+Deployment g_deployment(g_runtime, g_store);
+uint32_t g_heap_before = 0, g_heap_after = 0;
 
 void set_led(bool on) { digitalWrite(TINYMLOPS_LED_PIN, on ? HIGH : LOW); }
-
-// ---------------------------------------------------------------------------
-// Telemetry
-// ---------------------------------------------------------------------------
-void print_telemetry() {
-  Serial.println();
-  Serial.println("==================================================================");
-  Serial.println(" TinyMLOps | KD Student MNIST CNN on ESP32-WROOM-32 | TFLite Micro");
-  Serial.println("==================================================================");
-  Serial.printf("[TELEMETRY] FW_VERSION=%s BUILD=%s %s\n", TINYMLOPS_FW_VERSION, __DATE__, __TIME__);
-  Serial.printf("[TELEMETRY] CHIP=%s REV=%d CORES=%d CPU_MHZ=%u FLASH_BYTES=%u\n", ESP.getChipModel(),
-                ESP.getChipRevision(), ESP.getChipCores(), (unsigned)ESP.getCpuFreqMHz(),
-                (unsigned)ESP.getFlashChipSize());
-  Serial.printf("[TELEMETRY] MODEL_NAME=%s\n", kModelName);
-  Serial.printf("[TELEMETRY] MODEL_BYTES=%u MODEL_GENERATED=%s\n", g_mnist_model_data_len, kModelGeneratedAt);
-  Serial.printf("[TELEMETRY] MODEL_SHA256_EMBEDDED=%s\n", kModelSha256);
-  Serial.printf("[TELEMETRY] MODEL_SHA256_RUNTIME =%s\n", g_runtime_sha256);
-  Serial.printf("[TELEMETRY] MODEL_INTEGRITY=%s\n", g_integrity_ok ? "OK" : "MISMATCH");
-  Serial.printf("[TELEMETRY] HEAP_TOTAL=%u HEAP_FREE_BEFORE_ALLOC=%u HEAP_FREE_AFTER_ALLOC=%u\n",
-                (unsigned)ESP.getHeapSize(), (unsigned)g_heap_before_alloc, (unsigned)g_heap_after_alloc);
-  if (g_model_ready) {
-    const size_t used = interpreter->arena_used_bytes();
-    Serial.printf("[TELEMETRY] ARENA_USED=%u ARENA_SIZE=%d ARENA_UTIL=%.1f%%\n", (unsigned)used,
-                  kTensorArenaSize, 100.0 * used / kTensorArenaSize);
-    Serial.printf("[TELEMETRY] INPUT int8 [%d,%d,%d,%d] scale=%.8f zp=%d | OUTPUT int8 [%d,%d] scale=%.8f zp=%d\n",
-                  input->dims->data[0], input->dims->data[1], input->dims->data[2], input->dims->data[3],
-                  input->params.scale, (int)input->params.zero_point, output->dims->data[0],
-                  output->dims->data[1], output->params.scale, (int)output->params.zero_point);
-  }
-  Serial.println("------------------------------------------------------------------");
-}
-
-// ---------------------------------------------------------------------------
-// Model bring-up
-// ---------------------------------------------------------------------------
-bool setup_model() {
-  sha256_hex(g_mnist_model_data, g_mnist_model_data_len, g_runtime_sha256);
-  g_integrity_ok = (strcmp(g_runtime_sha256, kModelSha256) == 0) &&
-                   (strcmp(kModelSha256, TINYMLOPS_VECTORS_MODEL_SHA256) == 0);
-
-  model = tflite::GetModel(g_mnist_model_data);
-  if (model->version() != TFLITE_SCHEMA_VERSION) {
-    Serial.printf("[TINYMLOPS_FATAL] Model schema v%d != supported v%d\n", (int)model->version(),
-                  TFLITE_SCHEMA_VERSION);
-    return false;
-  }
-
-  // Only the 6 kernels the quality gate allows -> minimal flash footprint.
-  static tflite::MicroMutableOpResolver<6> resolver;
-  resolver.AddConv2D();
-  resolver.AddMaxPool2D();
-  resolver.AddReshape();
-  resolver.AddFullyConnected();
-  resolver.AddQuantize();
-  resolver.AddDequantize();
-
-  static tflite::MicroInterpreter static_interpreter(model, resolver, tensor_arena, kTensorArenaSize,
-                                                     error_reporter);
-  interpreter = &static_interpreter;
-
-  g_heap_before_alloc = ESP.getFreeHeap();
-  TfLiteStatus st = interpreter->AllocateTensors();
-  g_heap_after_alloc = ESP.getFreeHeap();
-  if (st != kTfLiteOk) {
-    Serial.printf("[TINYMLOPS_FATAL] AllocateTensors() failed (arena=%d bytes)\n", kTensorArenaSize);
-    return false;
-  }
-  input = interpreter->input(0);
-  output = interpreter->output(0);
-  if (input->type != kTfLiteInt8 || output->type != kTfLiteInt8 || input->bytes != (size_t)kImageSize) {
-    Serial.println("[TINYMLOPS_FATAL] Unexpected tensor type/shape (need int8 [1,28,28,1] -> int8 [1,10])");
-    return false;
-  }
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-// Built-in self test
-// ---------------------------------------------------------------------------
-bool run_bist() {
-  Serial.println("[BIST] Built-in self test: 10 golden MNIST digits (INT8)");
-  Serial.println("+-------+----------+-----------+------------+--------------+--------+--------+");
-  Serial.println("| Digit | Expected | Predicted | Confidence | Latency (us) | Parity | Status |");
-  Serial.println("+-------+----------+-----------+------------+--------------+--------+--------+");
-  int passed = 0, bitexact = 0;
-  int64_t total_us = 0, min_us = INT64_MAX, max_us = 0;
-  for (int i = 0; i < kNumTestVectors; ++i) {
-    InferenceResult r = run_inference(kTestImages[i]);
-    if (!r.ok) {
-      Serial.printf("[TINYMLOPS_FATAL] Invoke() failed on vector %d\n", i);
-      return false;
-    }
-    const bool ok = (r.pred == kTestLabels[i]);
-    const bool exact = memcmp(r.logits, kExpectedLogits[i], kNumClasses) == 0;
-    passed += ok;
-    bitexact += exact;
-    total_us += r.latency_us;
-    if (r.latency_us < min_us) min_us = r.latency_us;
-    if (r.latency_us > max_us) max_us = r.latency_us;
-    Serial.printf("| %5d | %8d | %9d | %9.2f%% | %12lld | %-6s | %-6s |\n", i, kTestLabels[i], r.pred,
-                  r.confidence, (long long)r.latency_us, exact ? "EXACT" : "DIFF", ok ? "PASS" : "FAIL");
-  }
-  Serial.println("+-------+----------+-----------+------------+--------------+--------+--------+");
-  const double avg = (double)total_us / kNumTestVectors;
-  const size_t arena = interpreter->arena_used_bytes();
-  Serial.printf("[TINYMLOPS_LATENCY] MIN_US=%lld MAX_US=%lld AVG_US=%.1f\n", (long long)min_us,
-                (long long)max_us, avg);
-  Serial.printf("[TINYMLOPS_PARITY] BITEXACT=%d/%d\n", bitexact, kNumTestVectors);
-  Serial.printf("[TINYMLOPS_TEST_SUMMARY] PASSED=%d/%d ACCURACY=%.2f%% AVG_LATENCY_US=%.1f ARENA_BYTES=%u\n",
-                passed, kNumTestVectors, 100.0 * passed / kNumTestVectors, avg, (unsigned)arena);
-  return passed == kNumTestVectors;
-}
 
 void signal_result(bool pass) {
   if (pass) {
@@ -302,14 +93,36 @@ void signal_result(bool pass) {
   }
 }
 
+void print_header() {
+  Serial.println();
+  Serial.println("==================================================================");
+  Serial.println(" TinyMLOps | KD Student MNIST CNN on ESP32-WROOM-32 | TFLite Micro");
+  Serial.println("==================================================================");
+  Serial.printf("[TELEMETRY] FW_VERSION=%s BUILD=%s %s\n", TINYMLOPS_FW_VERSION, __DATE__, __TIME__);
+  Serial.printf("[TELEMETRY] CHIP=%s REV=%d CORES=%d CPU_MHZ=%u FLASH_BYTES=%u\n", ESP.getChipModel(),
+                ESP.getChipRevision(), ESP.getChipCores(), (unsigned)ESP.getCpuFreqMHz(),
+                (unsigned)ESP.getFlashChipSize());
+  Serial.printf("[TELEMETRY] FACTORY_MODEL_BYTES=%u FACTORY_MODEL_GENERATED=%s\n", g_mnist_model_data_len,
+                kModelGeneratedAt);
+}
+
+void print_info() {
+  print_header();
+  Serial.printf("[TELEMETRY] HEAP_TOTAL=%u HEAP_FREE_BEFORE_ALLOC=%u HEAP_FREE_AFTER_ALLOC=%u\n",
+                (unsigned)ESP.getHeapSize(), (unsigned)g_heap_before, (unsigned)g_heap_after);
+  g_deployment.print_telemetry();
+  Serial.println("------------------------------------------------------------------");
+}
+
 // ---------------------------------------------------------------------------
 // UART command interface
 // ---------------------------------------------------------------------------
 constexpr size_t kLineMax = 4096;  // 784 * "-128," = 3920 chars + prefix
+constexpr size_t kMaxImage = 4096;
 char g_line[kLineMax];
 size_t g_line_len = 0;
 bool g_line_overflow = false;
-int8_t g_frame[kImageSize];
+int8_t g_frame[kMaxImage];
 
 int hex_nibble(char c) {
   if (c >= '0' && c <= '9') return c - '0';
@@ -318,17 +131,15 @@ int hex_nibble(char c) {
   return -1;
 }
 
-// Parses either 784 decimal int8 values (comma / whitespace separated) or a
-// 1568-char hex string (two's-complement bytes). Returns number of values parsed
-// or -1 on a syntax/range error.
-int parse_frame(const char* s, int8_t* out) {
+// Parses `want` int8 values (comma/space separated decimals) or 2*want hex chars.
+int parse_frame(const char* s, int8_t* out, int want) {
   while (*s == ' ') ++s;
   const size_t n = strlen(s);
-  bool is_hex = (n == 2 * (size_t)kImageSize);
+  bool is_hex = (n == 2 * (size_t)want);
   for (size_t i = 0; is_hex && i < n; ++i) is_hex = hex_nibble(s[i]) >= 0;
   if (is_hex) {
-    for (int i = 0; i < kImageSize; ++i) out[i] = (int8_t)((hex_nibble(s[2 * i]) << 4) | hex_nibble(s[2 * i + 1]));
-    return kImageSize;
+    for (int i = 0; i < want; ++i) out[i] = (int8_t)((hex_nibble(s[2 * i]) << 4) | hex_nibble(s[2 * i + 1]));
+    return want;
   }
   int count = 0;
   const char* p = s;
@@ -338,76 +149,93 @@ int parse_frame(const char* s, int8_t* out) {
     char* end = nullptr;
     long v = strtol(p, &end, 10);
     if (end == p || v < -128 || v > 127) return -1;
-    if (count >= kImageSize) return count + 1;  // too many values
+    if (count >= want) return count + 1;
     out[count++] = (int8_t)v;
     p = end;
   }
   return count;
 }
 
-void respond_inference(const InferenceResult& r, int label, int index) {
-  Serial.printf("{");
-  if (index >= 0) Serial.printf("\"idx\":%d,\"label\":%d,", index, label);
-  Serial.printf("\"pred\":%d,\"score\":%d,\"latency_us\":%lld,\"confidence\":%.2f,\"logits\":", r.pred,
-                (int)r.score, (long long)r.latency_us, r.confidence);
-  print_logits_json(r.logits);
-  if (index >= 0) {
-    Serial.printf(",\"parity\":\"%s\"", memcmp(r.logits, kExpectedLogits[index], kNumClasses) == 0 ? "EXACT" : "DIFF");
-  }
-  Serial.println("}");
+// Built into one buffer and written with a single call: the OTA task logs from the other core,
+// and a reply split across several writes could get an [OTA] line spliced into it.
+void respond(const InferenceResult& r, int label, int index, bool exact) {
+  char buf[320];
+  int n = 0;
+  n += snprintf(buf + n, sizeof(buf) - n, "{");
+  if (index >= 0) n += snprintf(buf + n, sizeof(buf) - n, "\"idx\":%d,\"label\":%d,", index, label);
+  n += snprintf(buf + n, sizeof(buf) - n, "\"pred\":%d,\"score\":%d,\"latency_us\":%lld,\"confidence\":%.2f,\"logits\":[",
+                r.pred, (int)r.score, (long long)r.latency_us, r.confidence);
+  for (int i = 0; i < r.num_classes; ++i) n += snprintf(buf + n, sizeof(buf) - n, i ? ",%d" : "%d", r.logits[i]);
+  n += snprintf(buf + n, sizeof(buf) - n, "]");
+  if (index >= 0) n += snprintf(buf + n, sizeof(buf) - n, ",\"parity\":\"%s\"", exact ? "EXACT" : "DIFF");
+  snprintf(buf + n, sizeof(buf) - n, "}\n");
+  Serial.print(buf);
 }
 
 void handle_line(char* line) {
-  // strip trailing CR / spaces
   size_t n = strlen(line);
   while (n && (line[n - 1] == '\r' || line[n - 1] == ' ')) line[--n] = '\0';
   if (n == 0) return;
 
-  if (!g_model_ready) {
-    Serial.println("{\"error\":\"model not initialised\"}");
-    return;
-  }
   if (strncmp(line, "INFER:", 6) == 0) {
-    int count = parse_frame(line + 6, g_frame);
-    if (count != kImageSize) {
-      Serial.printf("{\"error\":\"expected %d int8 values, got %d\"}\n", kImageSize, count);
+    const int want = (int)g_deployment.image_size();
+    const int count = parse_frame(line + 6, g_frame, want);
+    if (count != want) {
+      Serial.printf("{\"error\":\"expected %d int8 values, got %d\"}\n", want, count);
       return;
     }
-    InferenceResult r = run_inference(g_frame);
+    InferenceResult r = g_deployment.infer(g_frame);
     if (!r.ok) {
       Serial.println("{\"error\":\"Invoke failed\"}");
       return;
     }
-    respond_inference(r, -1, -1);
+    respond(r, -1, -1, false);
   } else if (strncmp(line, "SELFTEST:", 9) == 0) {
-    int idx = atoi(line + 9);
-    if (idx < 0 || idx >= kNumTestVectors) {
-      Serial.println("{\"error\":\"index must be 0..9\"}");
+    const int idx = atoi(line + 9);
+    InferenceResult r;
+    uint8_t label = 0;
+    bool exact = false;
+    if (idx < 0 || !g_deployment.selftest((uint16_t)idx, &r, &label, &exact)) {
+      Serial.printf("{\"error\":\"index must be 0..%d\"}\n", g_deployment.vector_count() - 1);
       return;
     }
-    InferenceResult r = run_inference(kTestImages[idx]);
-    respond_inference(r, kTestLabels[idx], idx);
+    respond(r, label, idx, exact);
   } else if (strcmp(line, "BIST") == 0) {
-    signal_result(run_bist());
+    signal_result(g_deployment.run_bist(true).all_passed());
   } else if (strcmp(line, "INFO") == 0) {
-    print_telemetry();
+    print_info();
   } else if (strcmp(line, "PING") == 0) {
     Serial.println("PONG");
+  } else if (strcmp(line, "OTA") == 0) {
+#if TINYMLOPS_OTA_ENABLED
+    Serial.println("[OTA] manual check requested");
+    ota_trigger();
+#else
+    Serial.println("{\"error\":\"OTA disabled in this build\"}");
+#endif
+  } else if (strcmp(line, "STATUS") == 0) {
+    const ActiveState s = g_deployment.state();
+    Serial.printf("[STATUS] MODEL=%s SLOT=%c VERSION=%ld SHA256=%.16s...\n", g_deployment.model_name(), s.slot,
+                  (long)s.version, s.sha);
+#if TINYMLOPS_OTA_ENABLED
+    ota_print_status();
+#endif
+  } else if (strcmp(line, "FACTORY") == 0) {
+    const bool ok = g_deployment.force_factory();
+    Serial.printf("[STATUS] switched to factory model: %s\n", ok ? "OK" : "FAILED");
+    signal_result(g_deployment.run_bist(true).all_passed());
   } else {
-    Serial.println("{\"error\":\"unknown command (INFER:, SELFTEST:<n>, BIST, INFO, PING)\"}");
+    Serial.println("{\"error\":\"unknown command (INFER:, SELFTEST:<n>, BIST, INFO, PING, OTA, STATUS, FACTORY)\"}");
   }
 }
 
 void poll_serial() {
   while (Serial.available() > 0) {
-    char c = (char)Serial.read();
+    const char c = (char)Serial.read();
     if (c == '\n') {
       g_line[g_line_len] = '\0';
-      if (g_line_overflow) {
-        Serial.printf("{\"error\":\"line longer than %u bytes\"}\n", (unsigned)(kLineMax - 1));
-      } else {
-        handle_line(g_line);
-      }
+      if (g_line_overflow) Serial.printf("{\"error\":\"line longer than %u bytes\"}\n", (unsigned)(kLineMax - 1));
+      else handle_line(g_line);
       g_line_len = 0;
       g_line_overflow = false;
     } else if (g_line_len < kLineMax - 1) {
@@ -418,30 +246,74 @@ void poll_serial() {
   }
 }
 
+void poll_boot_button() {
+#if TINYMLOPS_OTA_ENABLED
+  static uint32_t pressed_at = 0;
+  const bool down = digitalRead(TINYMLOPS_BOOT_BUTTON_PIN) == LOW;
+  if (down && pressed_at == 0) pressed_at = millis();
+  if (!down && pressed_at && millis() - pressed_at > 50) {
+    Serial.println("[OTA] BOOT button -> check for a new model");
+    ota_trigger();
+  }
+  if (!down) pressed_at = 0;
+#endif
+}
+
 }  // namespace
 
 // =============================================================================
 void setup() {
   pinMode(TINYMLOPS_LED_PIN, OUTPUT);
+  pinMode(TINYMLOPS_BOOT_BUTTON_PIN, INPUT_PULLUP);
   set_led(false);
   Serial.setRxBufferSize(kLineMax);
   Serial.begin(115200);
   delay(200);
 
-  g_model_ready = setup_model();
-  print_telemetry();
-  if (!g_model_ready) {
-    signal_result(false);
-    return;
+  print_header();
+  if (strcmp(kModelSha256, TINYMLOPS_VECTORS_MODEL_SHA256) != 0) {
+    Serial.println("[WARN] model_data.h and test_vectors.h come from different models");
   }
-  if (!g_integrity_ok) {
-    Serial.println("[WARN] Model SHA-256 mismatch between flash, model_data.h and test_vectors.h");
-  }
-  signal_result(run_bist());
-  Serial.println("[TINYMLOPS_READY] Commands: INFER:<784 int8>, SELFTEST:<0-9>, BIST, INFO, PING");
+  if (!g_store.begin()) Serial.println("[WARN] LittleFS mount failed - only the factory model is available");
+
+  VectorSet factory;
+  factory.count = kNumTestVectors;
+  factory.image_size = kImageSize;
+  factory.num_classes = kNumClasses;
+  factory.input_scale = kInputScale;
+  factory.input_zero_point = kInputZeroPoint;
+  factory.output_scale = kOutputScale;
+  factory.output_zero_point = kOutputZeroPoint;
+  factory.labels = kTestLabels;
+  factory.expected_logits = &kExpectedLogits[0][0];
+  factory.images = &kTestImages[0][0];
+  g_deployment.set_factory(g_mnist_model_data, g_mnist_model_data_len, kModelSha256, kModelName, factory);
+  g_deployment.set_require_bitexact(TINYMLOPS_OTA_REQUIRE_BITEXACT);
+
+  g_heap_before = ESP.getFreeHeap();
+  const bool pass = g_deployment.boot();
+  g_heap_after = ESP.getFreeHeap();
+  Serial.printf("[TELEMETRY] HEAP_TOTAL=%u HEAP_FREE_BEFORE_ALLOC=%u HEAP_FREE_AFTER_ALLOC=%u\n",
+                (unsigned)ESP.getHeapSize(), (unsigned)g_heap_before, (unsigned)g_heap_after);
+  signal_result(pass);
+  Serial.println("[TINYMLOPS_READY] Commands: INFER:<784 int8>, SELFTEST:<0-9>, BIST, INFO, PING, OTA, STATUS, FACTORY");
+
+#if TINYMLOPS_OTA_ENABLED
+  OtaConfig cfg;
+  cfg.wifi_ssid = TINYMLOPS_WIFI_SSID;
+  cfg.wifi_password = TINYMLOPS_WIFI_PASSWORD;
+  cfg.manifest_url = TINYMLOPS_MANIFEST_URL;
+  cfg.firmware_version = TINYMLOPS_FW_VERSION;
+  cfg.supported_ops = kSupportedOps;
+  cfg.interval_s = TINYMLOPS_OTA_INTERVAL_S;
+  cfg.tls_insecure = TINYMLOPS_OTA_TLS_INSECURE;
+  cfg.led_pin = TINYMLOPS_LED_PIN;
+  ota_start(&g_deployment, &g_store, cfg);
+#endif
 }
 
 void loop() {
   poll_serial();
+  poll_boot_button();
   delay(1);
 }

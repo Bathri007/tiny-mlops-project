@@ -1,0 +1,29 @@
+# Wokwi automation scenario: over-the-air MODEL update, end to end, on a simulated ESP32.
+# Run by CI job "4 · OTA smoke test" right after a model was published as a GitHub Release, and
+# locally with:  cd firmware_esp32 && wokwi-cli --timeout 600000 --scenario test_scenario_ota.yaml .
+#
+# The firmware under test is built from the COMMITTED headers, so its factory model differs from the
+# model CI just trained and published. Expected flow over Wokwi's virtual WiFi (Wokwi-GUEST):
+#   factory model passes BIST -> WiFi -> NTP -> HTTPS manifest -> UPDATE decision -> download model +
+#   vectors into slot A (SHA-256 verified) -> on-device self-test 10/10 -> ACTIVATED -> serving it.
+name: TinyMLOps OTA model update
+version: 1
+author: CDS 303 TinyMLOps
+
+steps:
+  - wait-serial: "[TINYMLOPS_TEST_SUMMARY] PASSED=10/10"
+  - wait-serial: "[TINYMLOPS_READY]"
+  - wait-serial: "[OTA] WIFI_CONNECTED"
+  - wait-serial: "[OTA] TIME_SYNCED"
+  - wait-serial: "[OTA] MANIFEST version="
+  - wait-serial: "[OTA] DECISION UPDATE"
+  - wait-serial: "[OTA] DOWNLOAD model"
+  - wait-serial: "[OTA] DOWNLOAD vectors"
+  - wait-serial: "[OTA] ACTIVATED"
+  - wait-serial: "[TINYMLOPS_OTA_RESULT] STATUS=UPDATED"
+
+  # The downloaded model now answers on-demand inference with its own golden vectors.
+  - write-serial: "SELFTEST:7\n"
+  - wait-serial: '{"idx":7,"label":7,"pred":7,'
+  - write-serial: "STATUS\n"
+  - wait-serial: "[STATUS] MODEL=model-v"

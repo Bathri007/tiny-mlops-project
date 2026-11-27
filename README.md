@@ -160,13 +160,43 @@ These numbers come from local runs on Windows 11, Python 3.12.10, TF 2.16.2, CPU
 
 **Wokwi simulation in CI** (the earlier 20k-parameter CNN on the same firmware): BIST 10/10, `BITEXACT=10/10`, `MODEL_INTEGRITY=OK`, arena 11,108 / 32,768 B, LED / `PING` / `SELFTEST` all passing. Simulated latency is about 1 s per inference. Wokwi isn't cycle-accurate, so simulation is only checked against a loose 5 s ceiling. The 100 ms budget applies to `make hil` on a real board, and **real-board latency hasn't been measured yet**.
 
-## 8. Firmware serial protocol (115200 8N1, newline-terminated)
+## 8. Over-the-air (WiFi) model updates
+
+Firmware 2.0.0 updates its **model** over WiFi without reflashing. The firmware itself is not replaced. Every gate-approved model on `main` is published as a GitHub Release, and devices pick it up from `https://github.com/Bathri007/tiny-mlops-project/releases/latest/download/manifest.json`.
+
+```
+CI Job 3: package_model.py -> release model-vN: model.tflite + vectors.bin + manifest.json  (marked "latest")
+ESP32:    WiFi -> NTP -> HTTPS manifest -> decide -> download into the idle slot (A/B), SHA-256 checked
+          -> load it -> self-test with ITS golden vectors (10/10 correct AND bit-exact)
+          -> pass: switch (/state.txt)   fail: put the previous model back (rollback)
+CI Job 4: a simulated ESP32 (Wokwi, virtual WiFi) with the committed factory model must download,
+          verify, self-test and activate the release Job 3 just published
+```
+
+| Safety net | What it catches |
+| --- | --- |
+| Pinned root CAs + real date via NTP | Downloads from anything other than GitHub's real servers |
+| SHA-256 of model and vectors, checked while streaming | Corrupted or tampered files (`--demo-fault sha`) |
+| On-device self-test before switching | A model that runs but gives wrong answers on this device (`--demo-fault selftest`) |
+| Manifest checks: `min_firmware`, op list, size, no downgrades | Models this firmware cannot run, or old models replayed |
+| Factory model in flash, slots A/B, atomic state file | A bad slot at boot falls back to factory; the board is never bricked |
+
+- **WiFi:** copy `firmware_esp32/src/secrets.example.h` to `secrets.h` (git-ignored) and enter a 2.4 GHz network. Without it, the firmware uses Wokwi's `Wokwi-GUEST` network, which exists only in the simulator.
+- **Try it in VS Code Wokwi:** start the simulator. The `[OTA]` lines show each step, and `[TINYMLOPS_OTA_RESULT] STATUS=UPDATED` ends a successful update. `make sim-ota` runs the same check headless.
+- **Demonstrate the safety nets:** Actions → Run workflow → `demo_fault: sha` or `selftest`. Devices report `STATUS=REJECTED` or `STATUS=ROLLED_BACK` and keep serving the previous model. Publish a normal run afterwards so `latest` is a good model again.
+- **Build flags:** `TINYMLOPS_OTA_ENABLED` (default 1), `TINYMLOPS_OTA_INTERVAL_S` (default 300), `TINYMLOPS_OTA_REQUIRE_BITEXACT` (default 1), and `TINYMLOPS_OTA_TLS_INSECURE` (default 0; debugging only).
+- **Testing without hardware:** `tests/test_firmware_core.py` compiles the firmware's update logic (`firmware_esp32/lib/tinymlops_core`) with `g++`. It checks SHA-256 against `hashlib`, the vector pack against Python, every update decision, and real packaged releases, including both demo faults.
+
+## 9. Firmware serial protocol (115200 8N1, newline-terminated)
 
 | Command | Response |
 |---|---|
 | `INFER:<784 int8 comma-separated>` or `INFER:<1568 hex chars>` | `{"pred":7,"score":118,"latency_us":1420,"confidence":99.71,"logits":[...]}` |
 | `SELFTEST:<0-9>` | Same JSON plus `idx`, `label`, and `parity` (`EXACT`/`DIFF` against the host reference logits) |
 | `BIST` / `INFO` / `PING` | Reruns the self-test / reprints telemetry / `PONG` |
+| `OTA` | Check for a new model now (the BOOT button does the same) |
+| `STATUS` | Active model, slot, version, SHA-256, last OTA result, WiFi state |
+| `FACTORY` | Switch back to the factory model compiled into the firmware |
 
 Boot output includes machine-parseable lines:
 
@@ -178,7 +208,7 @@ Boot output includes machine-parseable lines:
 [TINYMLOPS_TEST_SUMMARY] PASSED=10/10 ACCURACY=100.00% AVG_LATENCY_US=<val> ARENA_BYTES=<val>
 ```
 
-## 9. Design decisions
+## 10. Design decisions
 
 * **The teacher is cached, not versioned.** It's about 2 MB and never deployed. Caching it by a hash of its own config means changing α, T or the student retrains only the student, which saves about 1.5–3 minutes per run locally and in CI.
 * **Import loads weights into the configured architecture.** It doesn't deserialize Colab's model config, so a newer Keras version in Colab doesn't matter, and an imported model that isn't the configured student fails loudly.

@@ -1,7 +1,8 @@
 # =============================================================================
 #  TinyMLOps CI/CD : Teacher -> Knowledge-distilled student -> INT8 PTQ ->
 #                    Quality Gates -> C++ Codegen -> PlatformIO build ->
-#                    Wokwi ESP32 HIL simulation -> Report
+#                    Wokwi ESP32 HIL simulation -> Publish model (GitHub Release)
+#                    -> OTA smoke test (simulated ESP32 downloads it over WiFi)
 # =============================================================================
 name: TinyMLOps KD Student MNIST ESP32 Pipeline
 
@@ -17,6 +18,15 @@ on:
         type: choice
         options: [train, colab_import]
         default: train
+      publish:
+        description: "Publish the approved model as a GitHub Release (devices update over WiFi)"
+        type: boolean
+        default: true
+      demo_fault:
+        description: "DEMO ONLY: publish a deliberately broken release that devices must reject"
+        type: choice
+        options: [none, sha, selftest]
+        default: none
 
 concurrency:
   group: tinymlops-${{ github.ref }}
@@ -184,6 +194,10 @@ jobs:
         run: |
           mkdir -p artifacts
           pio run -d firmware_esp32 | tee artifacts/pio_build.log
+        env:
+          # The factory-model BIST scenario runs without the WiFi updater so it is deterministic;
+          # job 4 tests the OTA-enabled build.
+          PLATFORMIO_BUILD_FLAGS: -DTINYMLOPS_OTA_ENABLED=0
 
       - name: Firmware resource report
         run: |
@@ -243,3 +257,129 @@ jobs:
             artifacts/pio_build.log
             artifacts/sim_report.md
             artifacts/sim_report.json
+
+  # ---------------------------------------------------------------------------
+  publish-model:
+    name: "3 · Publish model (GitHub Release)"
+    needs: [ml-train-and-gate, esp32-build-and-simulate]
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.pkg.outputs.tag }}
+      demo_fault: ${{ steps.pkg.outputs.demo_fault }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install packaging deps
+        run: pip install numpy==1.26.4 PyYAML==6.0.2
+
+      - name: Download the gate-approved model
+        uses: actions/download-artifact@v4
+        with:
+          name: tinyml-model
+          path: artifacts
+
+      - name: Package model + vectors + manifest
+        id: pkg
+        env:
+          DEMO_FAULT: ${{ inputs.demo_fault || 'none' }}
+        run: |
+          # run_attempt keeps versions unique and increasing when a run is re-run
+          VERSION=$(( ${{ github.run_number }} * 100 + ${{ github.run_attempt }} ))
+          TAG="model-v${VERSION}"
+          python ml_pipeline/package_model.py --version "$VERSION" \
+            --base-url "https://github.com/${{ github.repository }}/releases/download/${TAG}" \
+            --git-sha "${{ github.sha }}" --demo-fault "$DEMO_FAULT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "demo_fault=$DEMO_FAULT" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release (marked latest -> devices pick it up)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.pkg.outputs.tag }}"
+          gh release create "$TAG" dist/model.tflite dist/vectors.bin dist/manifest.json \
+            --target "${{ github.sha }}" --title "KD student ${TAG#model-}" \
+            --notes-file dist/RELEASE_NOTES.md --latest
+          {
+            echo "## Published model release \`$TAG\`"
+            echo
+            cat dist/RELEASE_NOTES.md
+            echo
+            echo "Device manifest URL: https://github.com/${{ github.repository }}/releases/latest/download/manifest.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  ota-smoke-test:
+    name: "4 · OTA smoke test (Wokwi ESP32 over WiFi)"
+    needs: publish-model
+    if: needs.publish-model.outputs.demo_fault == 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      WOKWI_CLI_TOKEN: ${{ secrets.WOKWI_CLI_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache PlatformIO toolchains & libraries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('firmware_esp32/platformio.ini') }}
+
+      - name: Build OTA firmware with the committed factory model
+        run: |
+          pip install platformio==6.1.16
+          mkdir -p artifacts
+          pio run -d firmware_esp32 | tee artifacts/pio_build_ota.log
+
+      - name: Wokwi ESP32 downloads ${{ needs.publish-model.outputs.tag }} over WiFi
+        if: env.WOKWI_CLI_TOKEN != ''
+        uses: wokwi/wokwi-ci-action@v1
+        with:
+          token: ${{ secrets.WOKWI_CLI_TOKEN }}
+          path: firmware_esp32
+          timeout: 600000
+          scenario: test_scenario_ota.yaml
+          fail_text: "Guru Meditation"
+          serial_log_file: sim_ota_serial.log
+
+      - name: OTA report
+        if: always() && env.WOKWI_CLI_TOKEN != ''
+        run: |
+          LOG=firmware_esp32/sim_ota_serial.log
+          [ -f "$LOG" ] || LOG=sim_ota_serial.log
+          {
+            echo "## OTA smoke test: simulated ESP32 updates itself to \`${{ needs.publish-model.outputs.tag }}\`"
+            echo
+            echo '```text'
+            grep -E "^\[(OTA|TINYMLOPS_OTA_RESULT|STATUS)\]|MODEL_NAME=|PASSED=" "$LOG" || echo "(no OTA lines in the log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload OTA firmware + log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-ota-firmware-and-log
+          if-no-files-found: warn
+          path: |
+            firmware_esp32/.pio/build/esp32dev/firmware.bin
+            firmware_esp32/.pio/build/esp32dev/firmware.elf
+            firmware_esp32/sim_ota_serial.log
+            sim_ota_serial.log
