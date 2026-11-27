@@ -1,0 +1,118 @@
+schema: '2.0'
+stages:
+  prepare_train:
+    cmd: python ml_pipeline/train_and_quantize.py
+    deps:
+    - path: ml_pipeline/train_and_quantize.py
+      hash: md5
+      md5: c2b2b02464fc91e9de3850f51ba5cbd9
+      size: 11911
+    params:
+      ml_pipeline/config.yaml:
+        data:
+          num_classes: 10
+          input_shape:
+          - 28
+          - 28
+          - 1
+          validation_split: 0.1
+        model:
+          conv_filters: 12
+          conv_kernel:
+          - 3
+          - 3
+          pool_size:
+          - 2
+          - 2
+        project.seed: 42
+        quantization:
+          representative_samples: 100
+          inference_input_type: int8
+          inference_output_type: int8
+        training:
+          baseline:
+            batch_size: 32
+            epochs: 2
+            learning_rate: 0.001
+          qat:
+            batch_size: 32
+            epochs: 2
+            learning_rate: 0.0005
+    outs:
+    - path: artifacts/baseline_fp32.tflite
+      hash: md5
+      md5: 51955496759660ad10fa682e7ec7485d
+      size: 83836
+    - path: artifacts/metrics.json
+      hash: md5
+      md5: 5942278e3aa08c6d0286f1719b879155
+      size: 1039
+    - path: artifacts/model_qat_int8.tflite
+      hash: md5
+      md5: 1f6af6c18a62511da56660afb69ef87b
+      size: 23432
+  evaluate_gate:
+    cmd: python ml_pipeline/evaluate_and_gate.py
+    deps:
+    - path: artifacts/baseline_fp32.tflite
+      hash: md5
+      md5: 51955496759660ad10fa682e7ec7485d
+      size: 83836
+    - path: artifacts/model_qat_int8.tflite
+      hash: md5
+      md5: 1f6af6c18a62511da56660afb69ef87b
+      size: 23432
+    - path: ml_pipeline/evaluate_and_gate.py
+      hash: md5
+      md5: 89a922ab9c5ae644f36993731fcb2873
+      size: 20278
+    params:
+      ml_pipeline/config.yaml:
+        gates:
+          max_model_bytes: 35000
+          min_int8_accuracy: 0.96
+          max_accuracy_drop: 0.015
+          allowed_ops:
+          - CONV_2D
+          - MAX_POOL_2D
+          - RESHAPE
+          - FULLY_CONNECTED
+          - QUANTIZE
+          - DEQUANTIZE
+    outs:
+    - path: artifacts/gate_report.json
+      hash: md5
+      md5: b2351b2d8e660f2e2cdf051e6743ecff
+      size: 1804
+    - path: artifacts/golden_vectors.json
+      hash: md5
+      md5: d2489ca86e4af7564f01dbc136319268
+      size: 46928
+  codegen_cpp:
+    cmd: python ml_pipeline/export_to_cpp.py
+    deps:
+    - path: artifacts/gate_report.json
+      hash: md5
+      md5: b2351b2d8e660f2e2cdf051e6743ecff
+      size: 1804
+    - path: artifacts/golden_vectors.json
+      hash: md5
+      md5: d2489ca86e4af7564f01dbc136319268
+      size: 46928
+    - path: artifacts/model_qat_int8.tflite
+      hash: md5
+      md5: 1f6af6c18a62511da56660afb69ef87b
+      size: 23432
+    - path: ml_pipeline/export_to_cpp.py
+      hash: md5
+      md5: 705f02924cbd72eb3561422579b919f6
+      size: 9597
+    outs:
+    - path: firmware_esp32/src/model_data.h
+      hash: md5
+      md5: 8f6a1b3f181fa0a363e08314a5a2e94d
+      size: 149965
+    - path: firmware_esp32/src/test_vectors.h
+      hash: md5
+      md5: d12d10422ef01591a056c62073e3e055
+      size: 44524

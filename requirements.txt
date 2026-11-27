@@ -10,6 +10,7 @@ numpy==1.26.4
 # --- MLOps: experiment tracking & data/model versioning ---------------------
 mlflow==2.16.2
 dvc==3.55.2
+pathspec==0.12.1                      # dvc 3.55 breaks with pathspec >= 0.13
 
 # --- Config, tests, HIL serial ----------------------------------------------
 PyYAML==6.0.2
